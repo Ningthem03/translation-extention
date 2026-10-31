@@ -1,0 +1,14 @@
+﻿{
+  "manifest_version": 3,
+  "name": "Regional Accessibility & Simplification Overlay",
+  "version": "1.0",
+  "description": "Simplifies official jargon and provides voice output in regional languages.",
+  "permissions": ["activeTab", "scripting"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"]
+    }
+  ]
+}
