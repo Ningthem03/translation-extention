@@ -23,27 +23,79 @@ overlayModal.style.cssText = `
 `;
 document.body.appendChild(overlayModal);
 
-function triggerSpeech(textToSpeak) {
-  if (!textToSpeak) return;
-  
-  window.speechSynthesis.cancel();
-  
+let activeAudioUrl = null;
+let activeAudioPlayer = null;
+let activeAudioContext = null;
+let activeAudioSource = null;
+
+function unlockAudioFromClick() {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) return null;
+
+  try {
+    activeAudioContext = new Context();
+    // Resume immediately in the user's click handler so delayed model output
+    // can still play when it arrives.
+    activeAudioContext.resume().catch(() => {});
+    return activeAudioContext;
+  } catch (_) {
+    return null;
+  }
+}
+
+function clearManipuriAudio() {
+  if (activeAudioSource) {
+    try { activeAudioSource.stop(); } catch (_) {}
+    activeAudioSource = null;
+  }
+  if (activeAudioContext) {
+    activeAudioContext.close().catch(() => {});
+    activeAudioContext = null;
+  }
+  if (activeAudioPlayer) {
+    activeAudioPlayer.pause();
+    activeAudioPlayer.removeAttribute('src');
+    activeAudioPlayer.load();
+    activeAudioPlayer.remove();
+    activeAudioPlayer = null;
+  }
+  if (activeAudioUrl) {
+    URL.revokeObjectURL(activeAudioUrl);
+    activeAudioUrl = null;
+  }
+}
+
+function triggerSpeech(textToSpeak, language) {
+  if (!textToSpeak) return null;
+
   const utterance = new SpeechSynthesisUtterance(textToSpeak);
+  utterance.lang = language;
   utterance.rate = 0.85;
   utterance.pitch = 1.0;
   utterance.volume = 1.0;
 
   const voices = window.speechSynthesis.getVoices();
-  const selectedVoice = voices.find(v => v.lang.includes('hi') || v.lang.includes('en-IN') || v.lang.includes('en')) || voices[0];
+  const languagePrefix = language.toLowerCase().split('-')[0];
+  const selectedVoice = voices.find(v => v.lang.toLowerCase() === language.toLowerCase())
+    || voices.find(v => v.lang.toLowerCase().startsWith(`${languagePrefix}-`));
   
   if (selectedVoice) {
     utterance.voice = selectedVoice;
   }
   
   window.speechSynthesis.speak(utterance);
+  return utterance;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[char]);
 }
 
 floatBtn.addEventListener('click', async () => {
+  clearManipuriAudio();
+  const playbackContext = unlockAudioFromClick();
   const selectedText = window.getSelection().toString() || document.body.innerText.substring(0, 300);
   if (!selectedText) {
     overlayModal.style.display = 'block';
@@ -61,6 +113,7 @@ floatBtn.addEventListener('click', async () => {
     });
 
     const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || `Translation failed (HTTP ${response.status}).` );
 
     // Render output into non-blocking custom modal
     overlayModal.style.display = 'block';
@@ -71,26 +124,83 @@ floatBtn.addEventListener('click', async () => {
       </div>
       <div style="margin-bottom:8px;">
         <small style="color:#64748b; font-weight:600;">SIMPLIFIED ENGLISH:</small>
-        <p style="margin:4px 0 8px 0; font-size:13px;">${data.simplified_english}</p>
+        <p style="margin:4px 0 8px 0; font-size:13px;">${escapeHtml(data.simplified_english)}</p>
       </div>
       <div>
         <small style="color:#64748b; font-weight:600;">MANIPURI (MEITEI MAYEK):</small>
-        <p style="margin:4px 0 0 0; font-size:15px; font-weight:bold; color:#0f172a;">${data.translated_text}</p>
+        <p style="margin:4px 0 0 0; font-size:15px; font-weight:bold; color:#0f172a;">${escapeHtml(data.translated_text)}</p>
       </div>
+      <button id="playManipuri" style="margin-top:12px;padding:8px 12px;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer;">Retry Manipuri audio</button>
+      <span id="audioStatus" style="display:block;margin-top:6px;font-size:12px;color:#64748b;"></span>
     `;
 
-    document.getElementById('closeOverlay').onclick = () => {
+    overlayModal.querySelector('#closeOverlay').onclick = () => {
       overlayModal.style.display = 'none';
       window.speechSynthesis.cancel();
+      clearManipuriAudio();
     };
 
-    // Play speech output
-    triggerSpeech(data.speak_text);
+    // English uses the browser voice; Manipuri audio is synthesized by the backend.
+    window.speechSynthesis.cancel();
+    triggerSpeech(data.speak_text, 'en-IN');
+    const playButton = overlayModal.querySelector('#playManipuri');
+    const audioStatus = overlayModal.querySelector('#audioStatus');
+    const generateAndPlayManipuri = async context => {
+      playButton.disabled = true;
+      audioStatus.textContent = 'Generating Manipuri voice…';
+      try {
+        const audioResponse = await fetch('http://localhost:8000/api/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: data.translated_text })
+        });
+        if (!audioResponse.ok) {
+          const failure = await audioResponse.json().catch(() => ({}));
+          throw new Error(failure.detail || `Audio generation failed (HTTP ${audioResponse.status}).`);
+        }
+
+        const audioBlob = await audioResponse.blob();
+        activeAudioUrl = URL.createObjectURL(audioBlob);
+        activeAudioPlayer = document.createElement('audio');
+        activeAudioPlayer.controls = true;
+        activeAudioPlayer.preload = 'metadata';
+        activeAudioPlayer.style.cssText = 'display:block;width:100%;margin-top:8px;';
+        activeAudioPlayer.src = activeAudioUrl;
+        audioStatus.insertAdjacentElement('afterend', activeAudioPlayer);
+
+        if (context && activeAudioContext === context) {
+          await context.resume();
+          const buffer = await context.decodeAudioData(await audioBlob.arrayBuffer());
+          const source = context.createBufferSource();
+          source.buffer = buffer;
+          source.connect(context.destination);
+          activeAudioSource = source;
+          source.onended = () => { if (activeAudioSource === source) activeAudioSource = null; };
+          source.start();
+          audioStatus.textContent = 'Playing Manipuri audio. Use the player to replay it.';
+        } else {
+          audioStatus.textContent = 'Audio ready. Press play in the player.';
+        }
+      } catch (audioError) {
+        audioStatus.textContent = audioError.message || 'Could not generate Manipuri audio.';
+      } finally {
+        playButton.disabled = false;
+      }
+    };
+
+    playButton.onclick = () => {
+      clearManipuriAudio();
+      const retryContext = unlockAudioFromClick();
+      void generateAndPlayManipuri(retryContext);
+    };
+    void generateAndPlayManipuri(playbackContext);
 
   } catch (err) {
     overlayModal.style.display = 'block';
-    overlayModal.innerHTML = '<strong>Backend Error:</strong> Ensure backend is running on http://localhost:8000';
+    overlayModal.textContent = err.message || 'Backend error. Ensure the backend is running on http://localhost:8000.';
   } finally {
     floatBtn.innerText = '🔊 Simplify & Read (Manipuri)';
   }
 });
+
+
